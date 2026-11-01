@@ -1,1 +1,423 @@
-123
+## =============================================================================
+##  Longitudinal grip-strength trajectories and incident arthritis
+##
+## =============================================================================
+
+rm(list = ls()); invisible(gc())
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(survival)
+  library(survminer)
+  library(patchwork)
+  library(forestploter)
+  library(grid)
+  library(Cairo)
+  library(openxlsx)
+})
+
+## ---- 0. Configuration ----------------------------------------------------------
+## Paths are resolved relative to a project root. Define PROJECT_ROOT
+## (e.g. in .Renviron) or simply run the script from the project folder.
+cfg <- list(
+  root     = Sys.getenv("PROJECT_ROOT", unset = getwd()),
+  in_dir   = ".",
+  out_dir  = ".",
+  f_class  = "trajectory_classes.rds",  # list: <cohort>$class_results (ID, GBTM)
+  f_event  = "event_followup.rds",      # ID, Data_Source, Arthritis_Status, Arthritis_Time_Years
+  f_panel  = "analytic_panel.RData",    # long-format panel with baseline covariates
+  panel_nm = NULL                       # object name inside .RData (NULL = first object)
+)
+
+in_path  <- function(f) file.path(cfg$root, cfg$in_dir, f)
+out_path <- function(f) {
+  d <- file.path(cfg$root, cfg$out_dir)
+  if (!dir.exists(d)) dir.create(d, recursive = TRUE)
+  file.path(d, f)
+}
+log_msg <- function(fmt, ...) message(sprintf(fmt, ...))
+fmt_p   <- function(p, digits = 3) {
+  ifelse(is.na(p), "",
+         ifelse(p < 0.001, "<0.001", formatC(p, format = "f", digits = digits)))
+}
+read_rdata_obj <- function(path, which = NULL) {
+  env <- new.env(parent = emptyenv())
+  nm  <- load(path, envir = env)
+  env[[if (is.null(which)) nm[1] else which]]
+}
+write_book <- function(sheets, file) {
+  wb <- createWorkbook()
+  iwalk(sheets, function(df, nm) { addWorksheet(wb, nm); writeData(wb, nm, df) })
+  saveWorkbook(wb, file, overwrite = TRUE)
+  log_msg("Workbook written: %s", basename(file))
+}
+
+## ---- 1. Study constants --------------------------------------------------------
+.cohorts    <- c("CHARLS", "HRS", "ELSA", "KLoSA")
+.base_wave  <- c(CHARLS = 1L, HRS = 8L, ELSA = 2L, KLoSA = 3L)
+.cohort_lab <- c(CHARLS = "CHARLS (China)",  HRS   = "HRS (United States)",
+                 ELSA   = "ELSA (England)",  KLoSA = "KLoSA (South Korea)")
+
+.traj_lv  <- c("High grip strength", "Moderate grip strength", "Low grip strength")
+.ref_lv   <- .traj_lv[1]
+## latent class index -> substantive label (fixed across cohorts, consistent with Fig. 3)
+.class_key <- c(`1` = "Moderate grip strength",
+                `2` = "High grip strength",
+                `3` = "Low grip strength")
+.traj_pal <- setNames(c("#2166AC", "#66BD63", "#BC3C29"), .traj_lv)
+.models   <- c("Model 1", "Model 2", "Model 3")
+
+.baseline_covars <- c("Age", "Gender", "Education", "Marital_Status",
+                      "Smoking", "Drinking", "BMI", "Depression",
+                      "Hypertension", "Diabetes_Mellitus", "Heart_Disease",
+                      "Stroke", "Cancer", "Chronic_Lung_Disease")
+
+## landmark times (years) for tabulated cumulative incidence
+.landmarks <- list(CHARLS = c(2, 4), HRS = c(4, 8), ELSA = c(4, 8), KLoSA = c(4, 8))
+
+## ---- 2. Inputs -----------------------------------------------------------------
+log_msg("Loading inputs ...")
+traj_obj  <- readRDS(in_path(cfg$f_class))
+event_tbl <- readRDS(in_path(cfg$f_event)) %>% mutate(ID = as.character(ID))
+panel_tbl <- read_rdata_obj(in_path(cfg$f_panel), cfg$panel_nm) %>%
+  mutate(ID = as.character(ID))
+
+## ---- 3. Cohort-specific analytic data -----------------------------------------
+assemble_cohort <- function(db, covariates = FALSE) {
+
+  cls <- traj_obj[[db]]$class_results %>%
+    mutate(ID = as.character(ID),
+           Traj_Label = factor(unname(.class_key[as.character(GBTM)]), levels = .traj_lv)) %>%
+    select(ID, GBTM, Traj_Label)
+
+  if (covariates) {
+    cls <- cls %>%
+      left_join(panel_tbl %>%
+                  filter(Data_Source == db, Wave == .base_wave[[db]]) %>%
+                  select(ID, all_of(.baseline_covars)),
+                by = "ID")
+  }
+
+  out <- cls %>%
+    left_join(event_tbl %>%
+                filter(Data_Source == db) %>%
+                select(ID, Arthritis_Status, Arthritis_Time_Years),
+              by = "ID") %>%
+    filter(!is.na(Arthritis_Status), !is.na(Arthritis_Time_Years))
+
+  if (covariates) {
+    out <- out %>%
+      mutate(across(c(Gender, Education, Smoking, Drinking, Marital_Status), factor),
+             Traj_Label = relevel(Traj_Label, ref = .ref_lv))
+  }
+
+  log_msg("  %-6s n = %d | classes %s | events = %d (%.1f%%)",
+          db, nrow(out), paste(table(out$Traj_Label), collapse = "/"),
+          as.integer(sum(out$Arthritis_Status)), 100 * mean(out$Arthritis_Status))
+  out
+}
+
+log_msg("Assembling analytic samples ...")
+km_data  <- setNames(lapply(.cohorts, assemble_cohort), .cohorts)
+cox_data <- setNames(lapply(.cohorts, assemble_cohort, covariates = TRUE), .cohorts)
+
+## =============================================================================
+##  FIGURE 4 : cumulative incidence curves
+## =============================================================================
+draw_cuminc <- function(dat, title) {
+
+  fml  <- Surv(Arthritis_Time_Years, Arthritis_Status) ~ Traj_Label
+  fit  <- survfit(fml, data = dat)
+  lr   <- survdiff(fml, data = dat)
+  p_lr <- pchisq(lr$chisq, df = n_distinct(dat$Traj_Label) - 1, lower.tail = FALSE)
+  p_lab <- if (p_lr < 0.001) "Log-rank P < 0.001" else sprintf("Log-rank P = %.3f", p_lr)
+
+  ## KM survival -> cumulative incidence (1 - S), anchored at the origin
+  curve <- tibble(time = fit$time, surv = fit$surv, lo = fit$lower, hi = fit$upper,
+                  strata = rep(names(fit$strata), fit$strata)) %>%
+    transmute(time,
+              ci    = 1 - surv,
+              ci_lo = 1 - hi,
+              ci_hi = 1 - lo,
+              Traj_Label = factor(sub("^Traj_Label=", "", strata), levels = .traj_lv)) %>%
+    bind_rows(tibble(time = 0, ci = 0, ci_lo = 0, ci_hi = 0,
+                     Traj_Label = factor(.traj_lv, levels = .traj_lv)), .)
+
+  tally <- dat %>%
+    group_by(Traj_Label) %>%
+    summarise(n = n(), events = sum(Arthritis_Status), .groups = "drop")
+  leg <- setNames(sprintf("%s (n=%d, events=%d)", as.character(tally$Traj_Label),
+                          as.integer(tally$n), as.integer(tally$events)),
+                  as.character(tally$Traj_Label))
+
+  ## x-axis upper bound: maximum follow-up rounded up to an even number
+  t_max <- ceiling(max(dat$Arthritis_Time_Years, na.rm = TRUE))
+  t_max <- t_max + t_max %% 2
+
+  p <- ggplot(curve, aes(time, ci * 100, colour = Traj_Label, fill = Traj_Label)) +
+    geom_ribbon(aes(ymin = ci_lo * 100, ymax = ci_hi * 100), alpha = 0.1, colour = NA) +
+    geom_step(linewidth = 0.9) +
+    scale_colour_manual(values = .traj_pal, labels = leg) +
+    scale_fill_manual(values = .traj_pal, labels = leg) +
+    scale_x_continuous(breaks = seq(0, t_max, 2), limits = c(0, t_max),
+                       expand = expansion(mult = c(0.01, 0.02))) +
+    scale_y_continuous(expand = expansion(mult = c(0.01, 0.05))) +
+    annotate("text", x = 0.3, y = Inf, label = p_lab, hjust = 0, vjust = 1.5,
+             size = 3.5, fontface = "italic", colour = "#333333") +
+    labs(x = "Follow-up time (years)", y = "Cumulative incidence of arthritis (%)",
+         title = title, colour = NULL, fill = NULL) +
+    theme_minimal(base_size = 11) +
+    theme(
+      plot.title        = element_text(hjust = 0.5, face = "bold", size = 11),
+      axis.title        = element_text(face = "bold", size = 10),
+      axis.text         = element_text(size = 9, colour = "#333333"),
+      panel.grid.major  = element_line(colour = "#E8E8E8", linewidth = 0.3),
+      panel.grid.minor  = element_blank(),
+      panel.border      = element_rect(colour = "#CCCCCC", fill = NA, linewidth = 0.5),
+      legend.position   = "bottom",
+      legend.text       = element_text(size = 8),
+      legend.key.width  = unit(1.0, "cm"),
+      legend.key.height = unit(0.3, "cm"),
+      legend.background = element_blank(),
+      legend.key        = element_blank(),
+      plot.margin       = margin(t = 8, r = 10, b = 5, l = 8)
+    ) +
+    guides(colour = guide_legend(nrow = 1, override.aes = list(linewidth = 1)),
+           fill   = guide_legend(nrow = 1))
+
+  list(plot = p, p = p_lr, tally = tally, fit = fit)
+}
+
+log_msg("Rendering Figure 4 ...")
+fig4 <- setNames(lapply(.cohorts, function(db) draw_cuminc(km_data[[db]], .cohort_lab[[db]])),
+                 .cohorts)
+
+fig4_panel <- wrap_plots(lapply(fig4, `[[`, "plot"), ncol = 2) +
+  plot_annotation(tag_levels = "A",
+                  theme = theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 14))) &
+  theme(plot.tag = element_text(size = 15, face = "bold"))
+
+print(fig4_panel)
+CairoPDF(out_path("Figure4.pdf"), width = 17, height = 10)
+print(fig4_panel)
+invisible(dev.off())
+
+## --- Figure 4 tables ---
+cuminc_at <- function(fit, t, db) {
+  s <- summary(fit, times = t)
+  tibble(Database          = db,
+         Traj_Label        = sub("^Traj_Label=", "", s$strata),
+         Time_Years        = s$time,
+         N_Risk            = s$n.risk,
+         N_Event           = s$n.event,
+         Cum_Incidence_Pct = round((1 - s$surv)  * 100, 2),
+         CI_Lower_Pct      = round((1 - s$upper) * 100, 2),
+         CI_Upper_Pct      = round((1 - s$lower) * 100, 2))
+}
+
+fig4_events <- imap_dfr(fig4, ~ mutate(.x$tally, Database = .y)) %>%
+  mutate(Event_Rate_Pct = round(events / n * 100, 2)) %>%
+  select(Database, Traj_Label, n, events, Event_Rate_Pct) %>%
+  arrange(match(Database, .cohorts), match(Traj_Label, .traj_lv))
+
+fig4_lr <- tibble(Database = .cohorts, p = map_dbl(fig4, "p")) %>%
+  transmute(Database,
+            Log_Rank_P   = fmt_p(p, 4),
+            Significance = if_else(p < 0.05, "Yes", "No"))
+
+fig4_ci <- map_dfr(.cohorts, ~ cuminc_at(fig4[[.x]]$fit, .landmarks[[.x]], .x))
+
+write_book(list(Event_summary = fig4_events,
+                LogRank       = fig4_lr,
+                Cum_incidence = fig4_ci),
+           out_path("Figure4.xlsx"))
+
+## =============================================================================
+##  FIGURE 5 : Cox proportional hazards models + PH diagnostics
+## =============================================================================
+cox_formulas <- function(db) {
+  lhs <- "Surv(Arthritis_Time_Years, Arthritis_Status) ~ "
+  blk <- list(
+    demo  = c("Traj_Label", "Age", "Gender", "Education"),
+    life  = c("Smoking", "Drinking", "BMI"),
+    comor = c(if (db != "KLoSA") "Depression",          # depression unavailable in KLoSA
+              "Hypertension", "Diabetes_Mellitus", "Heart_Disease", "Stroke")
+  )
+  rhs <- list(`Model 1` = blk$demo,
+              `Model 2` = c(blk$demo, blk$life),
+              `Model 3` = c(blk$demo, blk$life, blk$comor))
+  lapply(rhs, function(v) as.formula(paste0(lhs, paste(v, collapse = " + "))))
+}
+
+fit_cox_suite <- function(dat, db) {
+  fs <- cox_formulas(db)
+  hr_rows <- list(); ph_rows <- list()
+
+  for (m in names(fs)) {
+    ## x/model = TRUE keeps the design matrix so cox.zph() needs no re-evaluation
+    fit <- tryCatch(coxph(fs[[m]], data = dat, x = TRUE, model = TRUE),
+                    error = function(e) {
+                      log_msg("  %s %s: fit failed (%s)", db, m, conditionMessage(e)); NULL
+                    })
+    if (is.null(fit)) next
+
+    s   <- summary(fit)
+    idx <- grep("^Traj_Label", rownames(s$coefficients))
+    hr_rows[[m]] <- bind_rows(
+      tibble(Database   = db, Model = m,
+             Trajectory = sub("^Traj_Label", "", rownames(s$coefficients)[idx]),
+             HR = s$conf.int[idx, 1], Lower = s$conf.int[idx, 3], Upper = s$conf.int[idx, 4],
+             P  = s$coefficients[idx, 5]),
+      tibble(Database = db, Model = m, Trajectory = .ref_lv,
+             HR = 1, Lower = 1, Upper = 1, P = NA_real_)
+    )
+    log_msg("  %s %s: converged, C-index = %.3f", db, m, s$concordance[1])
+
+    zph <- tryCatch(cox.zph(fit),
+                    error = function(e) {
+                      log_msg("  %s %s: PH test failed (%s)", db, m, conditionMessage(e)); NULL
+                    })
+    if (!is.null(zph)) {
+      tb <- as.data.frame(zph$table)
+      ph_rows[[m]] <- tibble(Database = db, Model = m, Term = rownames(tb),
+                             Chisq = round(tb$chisq, 3), df = tb$df, P = tb$p)
+    }
+  }
+  list(hr = bind_rows(hr_rows), ph = bind_rows(ph_rows))
+}
+
+log_msg("Fitting Cox models ...")
+cox_res <- setNames(lapply(.cohorts, function(db) fit_cox_suite(cox_data[[db]], db)), .cohorts)
+
+cox_all <- bind_rows(map(cox_res, "hr")) %>%
+  mutate(HR_CI     = if_else(Trajectory == .ref_lv, "1.00 (Ref.)",
+                             sprintf("%.2f (%.2f-%.2f)", HR, Lower, Upper)),
+         P_display = fmt_p(P))
+
+ph_all <- bind_rows(map(cox_res, "ph")) %>%
+  mutate(P_display = fmt_p(P))
+
+## --- forest-plot table and estimate vectors ---
+spacer <- strrep(" ", 39)
+fp_rows <- list()
+fp_est <- fp_lo <- fp_hi <- setNames(replicate(3, numeric(0), simplify = FALSE), .models)
+
+grab <- function(db, m, tr, col) {
+  v <- cox_all[[col]][cox_all$Database == db & cox_all$Model == m & cox_all$Trajectory == tr]
+  if (length(v)) v[1] else NA
+}
+push <- function(m, e, l, h) {
+  fp_est[[m]] <<- c(fp_est[[m]], e)
+  fp_lo[[m]]  <<- c(fp_lo[[m]],  l)
+  fp_hi[[m]]  <<- c(fp_hi[[m]],  h)
+}
+
+for (db in .cohorts) {
+  d <- cox_data[[db]]
+  fp_rows[[length(fp_rows) + 1]] <- c(
+    sprintf("%s (n=%d, events=%d)", .cohort_lab[[db]], nrow(d),
+            as.integer(sum(d$Arthritis_Status))),
+    rep("", 7))
+  for (m in .models) push(m, NA, NA, NA)
+
+  for (tr in .traj_lv) {
+    txt <- vapply(.models, function(m) {
+      x <- grab(db, m, tr, "HR_CI"); if (is.na(x)) "" else x
+    }, character(1))
+    fp_rows[[length(fp_rows) + 1]] <- c(paste0("  ", tr), as.character(sum(d$Traj_Label == tr)),
+                                        txt[1], spacer, txt[2], spacer, txt[3], spacer)
+    for (m in .models) {
+      if (tr == .ref_lv) push(m, NA, NA, NA)        # reference group: no point estimate
+      else push(m, grab(db, m, tr, "HR"), grab(db, m, tr, "Lower"), grab(db, m, tr, "Upper"))
+    }
+  }
+}
+
+fp_tab <- as.data.frame(do.call(rbind, fp_rows), stringsAsFactors = FALSE)
+names(fp_tab) <- c("Subgroup", "N", "Model 1", " ", "Model 2", "  ", "Model 3", "   ")
+
+fp_theme <- forest_theme(
+  base_size   = 10,
+  core        = list(fg_params = list(hjust = 0, x = 0.01, fontface = "plain"),
+                     bg_params = list(fill = c("white", alpha("#E2E2E2", 0.3)))),
+  colhead     = list(fg_params = list(hjust = 0, fontface = "bold"),
+                     bg_params = list(fill = "#E8F4F8")),
+  refline_gp  = gpar(col = "black", lty = "dashed", lwd = 0.8),
+  ci_pch      = 16,
+  ci_col      = "black",
+  ci_fill     = "red",
+  ci_lwd      = 1.5,
+  footnote_gp = gpar(col = "#636363", fontface = "italic", cex = 0.8),
+  vertline_gp = gpar(col = "#d0d0d0", lty = "solid", lwd = 0.5)
+)
+
+log_msg("Rendering Figure 5 ...")
+x_rng <- replicate(3, c(0, 8), simplify = FALSE)
+x_tck <- replicate(3, c(0, 1, 2, 4, 8), simplify = FALSE)
+
+fig5 <- forest(
+  fp_tab,
+  est       = unname(fp_est),
+  lower     = unname(fp_lo),
+  upper     = unname(fp_hi),
+  ci_column = c(4, 6, 8),
+  ref_line  = 1,
+  xlim      = x_rng,
+  ticks_at  = x_tck,
+  arrow_lab = c("Protective", "Risk"),
+  xlab      = "Hazard Ratio (95% CI)",
+  nudge_y   = 0,
+  theme     = fp_theme
+)
+
+print(fig5)
+CairoPDF(out_path("Figure5.pdf"), width = 13, height = 5)
+plot(fig5, newpage = FALSE)
+invisible(dev.off())
+
+## --- Figure 5 tables ---
+fig5_cox <- cox_all %>%
+  select(Database, Model, Trajectory, HR_CI, P_display) %>%
+  arrange(match(Database, .cohorts), Model, match(Trajectory, .traj_lv))
+
+fig5_spec <- tibble(
+  Model = .models,
+  Adjustment = c(
+    "Age + Gender + Education",
+    "Model 1 + Smoking + Drinking + BMI",
+    "Model 2 + Depression (not in KLoSA) + Hypertension + Diabetes + Heart Disease + Stroke"
+  )
+)
+
+fig5_events <- map_dfr(.cohorts, function(db) {
+  cox_data[[db]] %>%
+    group_by(Traj_Label) %>%
+    summarise(N                   = n(),
+              Events              = sum(Arthritis_Status),
+              Event_Rate_Pct      = round(mean(Arthritis_Status) * 100, 1),
+              Mean_Followup_Years = round(mean(Arthritis_Time_Years, na.rm = TRUE), 1),
+              .groups = "drop") %>%
+    mutate(Database = db, .before = 1)
+}) %>%
+  arrange(match(Database, .cohorts), match(Traj_Label, .traj_lv))
+
+fig5_ph <- ph_all %>% select(Database, Model, Term, Chisq, df, P_display)
+
+write_book(list(Cox_results   = fig5_cox,
+                Model_spec    = fig5_spec,
+                Event_summary = fig5_events,
+                PH_test       = fig5_ph),
+           out_path("Figure5.xlsx"))
+
+## ---- 4. Console summary --------------------------------------------------------
+cat("\n== Log-rank tests ==\n");                 print(fig4_lr)
+cat("\n== Event rates (KM samples) ==\n");       print(fig4_events)
+cat("\n== Cox estimates, Model 3 ==\n")
+print(cox_all %>% filter(Model == "Model 3") %>% select(Database, Trajectory, HR_CI, P_display))
+cat("\n== Event rates (Cox samples) ==\n");      print(fig5_events)
+cat("\n== PH test, Model 3 (trajectory term & global) ==\n")
+print(ph_all %>%
+        filter(Model == "Model 3", Term %in% c("Traj_Label", "GLOBAL")) %>%
+        select(Database, Term, Chisq, df, P_display))
+cat("\n== PH test, all models / all terms ==\n")
+print(fig5_ph, n = Inf)
